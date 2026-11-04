@@ -256,7 +256,7 @@ h1{margin:0 0 5px;font-size:clamp(22px,3vw,34px);line-height:1.08;color:#111827}
 
   <div class="footer">
     <span id="updated">Última actualización: —</span>
-    <span>Fuente: Associated Press (AP Elections)</span>
+    <span>Fuentes: Associated Press (AP Elections) / NYT election feed</span>
   </div>
   <div class="note">Las bancas y gobernaciones se contabilizan como definidas únicamente cuando Associated Press marca un ganador. Los liderazgos parciales no se suman como victorias.</div>
 </section>
@@ -264,6 +264,7 @@ h1{margin:0 0 5px;font-size:clamp(22px,3vw,34px);line-height:1.08;color:#111827}
 <script>
 const AP_META_URL='https://interactives.apelections.org/election-results/data-live/2026-11-03/results/national/metadata.json';
 const AP_PROGRESS_URL='https://interactives.apelections.org/election-results/data-live/2026-11-03/results/national/progress.json';
+const NYT_HOUSE_URL='https://static01.nyt.com/elections-assets/pages/data/2026-11-03/results-house.json';
 const $=id=>document.getElementById(id);
 
 const COLORS={
@@ -812,6 +813,56 @@ document.querySelectorAll('.map-tab').forEach(btn=>{
   });
 });
 
+
+function parseNYTHouseControl(raw){
+  try{
+    const office = raw &&
+      raw.partyControlData &&
+      raw.partyControlData.results &&
+      raw.partyControlData.results[0] &&
+      raw.partyControlData.results[0].offices &&
+      raw.partyControlData.results[0].offices.H;
+
+    if(!office || !office.party_balance) return null;
+
+    let dem=0,gop=0,other=0;
+
+    for(const [key,val] of Object.entries(office.party_balance)){
+      const seats=Number((val && val.seats) || 0);
+      const k=String(key||'').toUpperCase();
+
+      if(k==='D' || k.includes('DEM')) dem+=seats;
+      else if(k==='R' || k.includes('REP') || k.includes('GOP')) gop+=seats;
+      else other+=seats;
+    }
+
+    const decided=dem+gop+other;
+    if(!Number.isFinite(decided) || decided<=0 || decided>435) return null;
+
+    return {
+      dem,
+      gop,
+      other,
+      undecided:Math.max(0,435-decided),
+      called:Number(office.num_races_called || decided)
+    };
+  }catch(e){
+    return null;
+  }
+}
+
+function applyNYTHouseControl(raw){
+  const h=parseNYTHouseControl(raw);
+  if(!h) return false;
+
+  updatePanel('house',h,HOUSE_TOTAL,218);
+
+  const current=$('houseCalled');
+  if(current) current.textContent=h.called.toLocaleString('es-AR')+' carreras definidas';
+
+  return true;
+}
+
 function formatUpdated(payload){
   const raw=payload.generated_at_et || payload.generated_at;
   return raw ? String(raw) : '—';
@@ -842,16 +893,40 @@ function applyPayload(payload){
 async function refresh(){
   try{
     const bust='?t='+Date.now();
-    const [mr,pr]=await Promise.all([
-      fetch(AP_META_URL+bust,{cache:'no-store'}),
-      fetch(AP_PROGRESS_URL+bust,{cache:'no-store'})
-    ]);
-    if(!mr.ok) throw new Error('metadata HTTP '+mr.status);
-    if(!pr.ok) throw new Error('progress HTTP '+pr.status);
 
-    const [metadata,progress]=await Promise.all([mr.json(),pr.json()]);
-    const payload=normalizeAP(metadata,progress);
+    const [apMetaResult,apProgressResult,nytHouseResult]=await Promise.allSettled([
+      fetch(AP_META_URL+bust,{cache:'no-store'}).then(r=>{
+        if(!r.ok) throw new Error('metadata HTTP '+r.status);
+        return r.json();
+      }),
+      fetch(AP_PROGRESS_URL+bust,{cache:'no-store'}).then(r=>{
+        if(!r.ok) throw new Error('progress HTTP '+r.status);
+        return r.json();
+      }),
+      fetch(NYT_HOUSE_URL+bust,{cache:'no-store'}).then(r=>{
+        if(!r.ok) throw new Error('NYT House HTTP '+r.status);
+        return r.json();
+      })
+    ]);
+
+    if(apMetaResult.status!=='fulfilled') throw apMetaResult.reason;
+    if(apProgressResult.status!=='fulfilled') throw apProgressResult.reason;
+
+    const payload=normalizeAP(apMetaResult.value,apProgressResult.value);
     applyPayload(payload);
+
+    let houseAggregateApplied=false;
+    if(nytHouseResult.status==='fulfilled'){
+      houseAggregateApplied=applyNYTHouseControl(nytHouseResult.value);
+    }
+
+    if(houseAggregateApplied){
+      $('status').textContent='Resultados en vivo · Cámara con balance agregado de llamadas de AP.';
+    }else{
+      $('status').textContent='Resultados de AP · actualización automática cada 15 segundos.';
+    }
+
+    sendHeight();
   }catch(err){
     console.error(err);
     $('status').textContent='No se pudo actualizar AP en este momento; se conserva el último dato disponible.';
